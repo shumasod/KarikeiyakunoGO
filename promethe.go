@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	// HTTPリクエストの総数
+	// HTTPリクエストの総数をカウントする
 	httpRequestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "http_requests_total",

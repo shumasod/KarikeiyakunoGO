@@ -1,0 +1,73 @@
+// 3. データベース一括更新バッチ
+import (
+	"database/sql"
+	_ "github.com/lib/pq"
+)
+
+func sample3_DatabaseBatchUpdate() {
+	db, err := sql.Open("postgres", "postgres://user:pass@localhost/db")
+	if err != nil {
+		panic(err)
+	}
+	defer db.Close()
+	
+	// バッチサイズ設定
+	batchSize := 1000
+	records := generateRecords(100000) // 10万件のテストデータ
+	
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 10) // 同時実行数制限
+	
+	for i := 0; i < len(records); i += batchSize {
+		end := i + batchSize
+		if end > len(records) {
+			end = len(records)
+		}
+		
+		batch := records[i:end]
+		wg.Add(1)
+		semaphore <- struct{}{}
+		
+		go func(batch []Record) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+			
+			tx, err := db.Begin()
+			if err != nil {
+				fmt.Printf("Transaction error: %v\n", err)
+				return
+			}
+			
+			stmt, err := tx.Prepare("UPDATE users SET score = $1 WHERE id = $2")
+			if err != nil {
+				tx.Rollback()
+				return
+			}
+			defer stmt.Close()
+			
+			for _, record := range batch {
+				if _, err := stmt.Exec(record.Score, record.ID); err != nil {
+					fmt.Printf("Update error: %v\n", err)
+				}
+			}
+			
+			tx.Commit()
+			fmt.Printf("バッチ更新完了: %d件\n", len(batch))
+		}(batch)
+	}
+	
+	wg.Wait()
+}
+
+func generateRecords(count int) []Record {
+	records := make([]Record, count)
+	for i := 0; i < count; i++ {
+		records[i] = Record{
+			ID:    i + 1,
+			Name:  fmt.Sprintf("User%d", i),
+			Email: fmt.Sprintf("user%d@example.com", i),
+			Score: float64(i % 100),
+		}
+	}
+	return records
+}

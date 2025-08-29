@@ -1,0 +1,64 @@
+// 2. JSON一括処理バッチ
+import (
+	"bufio"
+	"encoding/json"
+	"sync"
+)
+
+type Record struct {
+	ID       int    `json:"id"`
+	Name     string `json:"name"`
+	Email    string `json:"email"`
+	Score    float64 `json:"score"`
+}
+
+func sample2_JSONProcessor() {
+	file, err := os.Open("large_data.json")
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+	
+	scanner := bufio.NewScanner(file)
+	recordsChan := make(chan Record, 1000)
+	resultsChan := make(chan Record, 1000)
+	
+	var wg sync.WaitGroup
+	numWorkers := runtime.NumCPU()
+	
+	// JSON処理ワーカー
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for record := range recordsChan {
+				// 処理ロジック（例：スコア正規化、データ検証）
+				if record.Score > 0 {
+					record.Score = record.Score / 100.0
+					resultsChan <- record
+				}
+			}
+		}()
+	}
+	
+	// JSON読み込み
+	go func() {
+		defer close(recordsChan)
+		for scanner.Scan() {
+			var record Record
+			if err := json.Unmarshal(scanner.Bytes(), &record); err == nil {
+				recordsChan <- record
+			}
+		}
+	}()
+	
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+	
+	// 結果収集
+	for processedRecord := range resultsChan {
+		fmt.Printf("処理済み: %+v\n", processedRecord)
+	}
+}

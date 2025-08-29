@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	// HTTPリクエストの総数をカウント
+	// HTTPリクエストの総数をカウントする
 	httpRequestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "http_requests_total",
@@ -20,7 +20,7 @@ var (
 		[]string{"path", "method", "status"},
 	)
 
-	// HTTPリクエストの処理時間を計測
+	// HTTPリクエストの処理時間を計測する
 	httpRequestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "http_request_duration_seconds",

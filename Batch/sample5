@@ -1,0 +1,66 @@
+// 5. 画像処理バッチ
+import (
+	"image"
+	"image/jpeg"
+	"image/png"
+)
+
+func sample5_ImageProcessor() {
+	imageFiles, _ := filepath.Glob("images/*.jpg")
+	
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, runtime.NumCPU())
+	
+	for _, filePath := range imageFiles {
+		wg.Add(1)
+		semaphore <- struct{}{}
+		
+		go func(path string) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+			
+			processImage(path)
+		}(filePath)
+	}
+	
+	wg.Wait()
+}
+
+func processImage(filePath string) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	
+	// 画像デコード
+	img, format, err := image.Decode(file)
+	if err != nil {
+		return
+	}
+	
+	// リサイズ処理（例）
+	resized := resizeImage(img, 800, 600)
+	
+	// 新しいファイルに保存
+	outputPath := fmt.Sprintf("processed_%s", filepath.Base(filePath))
+	outputFile, err := os.Create(outputPath)
+	if err != nil {
+		return
+	}
+	defer outputFile.Close()
+	
+	switch format {
+	case "jpeg":
+		jpeg.Encode(outputFile, resized, &jpeg.Options{Quality: 80})
+	case "png":
+		png.Encode(outputFile, resized)
+	}
+	
+	fmt.Printf("画像処理完了: %s\n", filePath)
+}
+
+func resizeImage(src image.Image, width, height int) image.Image {
+	// 簡単なリサイズ実装（実際にはサードパーティライブラリを使用）
+	return src // 簡略化
+}

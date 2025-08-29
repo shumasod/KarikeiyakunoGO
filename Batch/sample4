@@ -1,0 +1,79 @@
+// 4. HTTP並行リクエスト処理バッチ
+import (
+	"io"
+	"net/http"
+)
+
+type APIResponse struct {
+	URL    string
+	Status int
+	Body   string
+	Error  error
+}
+
+func sample4_HTTPBatchProcessor() {
+	urls := generateURLs(1000) // 1000個のURL
+	
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	
+	requestsChan := make(chan string, len(urls))
+	responsesChan := make(chan APIResponse, len(urls))
+	
+	var wg sync.WaitGroup
+	numWorkers := 50 // 並行リクエスト数
+	
+	// HTTP リクエストワーカー
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for url := range requestsChan {
+				resp, err := client.Get(url)
+				result := APIResponse{URL: url, Error: err}
+				
+				if err == nil {
+					result.Status = resp.StatusCode
+					body, _ := io.ReadAll(resp.Body)
+					result.Body = string(body)
+					resp.Body.Close()
+				}
+				
+				responsesChan <- result
+			}
+		}()
+	}
+	
+	// URL送信
+	go func() {
+		for _, url := range urls {
+			requestsChan <- url
+		}
+		close(requestsChan)
+	}()
+	
+	// レスポンス処理
+	go func() {
+		wg.Wait()
+		close(responsesChan)
+	}()
+	
+	successCount := 0
+	for response := range responsesChan {
+		if response.Error == nil && response.Status == 200 {
+			successCount++
+		}
+		fmt.Printf("処理完了: %s (Status: %d)\n", response.URL, response.Status)
+	}
+	
+	fmt.Printf("成功: %d/%d\n", successCount, len(urls))
+}
+
+func generateURLs(count int) []string {
+	urls := make([]string, count)
+	for i := 0; i < count; i++ {
+		urls[i] = fmt.Sprintf("https://api.example.com/data/%d", i)
+	}
+	return urls
+}

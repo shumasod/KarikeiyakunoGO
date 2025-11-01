@@ -1,15 +1,40 @@
-// 5. 画像処理バッチ
+package main
+
 import (
+	"fmt"
 	"image"
 	"image/jpeg"
 	"image/png"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
-func sample5_ImageProcessor() {
-	imageFiles, _ := filepath.Glob("images/*.jpg")
+// パターン1: 基本的な画像処理バッチ（修正版）
+func ImageProcessor_Basic() error {
+	startTime := time.Now()
+	
+	imageFiles, err := filepath.Glob("images/*.jpg")
+	if err != nil {
+		return fmt.Errorf("ファイル検索エラー: %w", err)
+	}
+	
+	if len(imageFiles) == 0 {
+		fmt.Println("処理対象の画像が見つかりません")
+		return nil
+	}
 	
 	var wg sync.WaitGroup
 	semaphore := make(chan struct{}, runtime.NumCPU())
+	var successCount, errorCount atomic.Int64
+	
+	// 出力ディレクトリ作成
+	if err := os.MkdirAll("processed", 0755); err != nil {
+		return fmt.Errorf("出力ディレクトリ作成エラー: %w", err)
+	}
 	
 	for _, filePath := range imageFiles {
 		wg.Add(1)
@@ -19,48 +44,253 @@ func sample5_ImageProcessor() {
 			defer wg.Done()
 			defer func() { <-semaphore }()
 			
-			processImage(path)
+			if err := processImage(path); err != nil {
+				errorCount.Add(1)
+				fmt.Printf("✗ エラー: %s - %v\n", path, err)
+			} else {
+				successCount.Add(1)
+				fmt.Printf("✓ 完了: %s\n", path)
+			}
 		}(filePath)
 	}
 	
 	wg.Wait()
+	
+	fmt.Printf("\n処理完了: 成功 %d, エラー %d, 所要時間: %v\n",
+		successCount.Load(), errorCount.Load(), time.Since(startTime))
+	
+	return nil
 }
 
-func processImage(filePath string) {
+// パターン2: 複数フォーマット対応版
+func ImageProcessor_MultiFormat() error {
+	startTime := time.Now()
+	
+	// 複数の画像フォーマットに対応
+	patterns := []string{
+		"images/*.jpg",
+		"images/*.jpeg",
+		"images/*.png",
+		"images/*.gif",
+	}
+	
+	var allFiles []string
+	for _, pattern := range patterns {
+		files, err := filepath.Glob(pattern)
+		if err != nil {
+			fmt.Printf("警告: %s の検索エラー: %v\n", pattern, err)
+			continue
+		}
+		allFiles = append(allFiles, files...)
+	}
+	
+	if len(allFiles) == 0 {
+		fmt.Println("処理対象の画像が見つかりません")
+		return nil
+	}
+	
+	fmt.Printf("処理対象: %d ファイル\n", len(allFiles))
+	
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, runtime.NumCPU())
+	var successCount, errorCount atomic.Int64
+	
+	if err := os.MkdirAll("processed", 0755); err != nil {
+		return fmt.Errorf("出力ディレクトリ作成エラー: %w", err)
+	}
+	
+	for _, filePath := range allFiles {
+		wg.Add(1)
+		semaphore <- struct{}{}
+		
+		go func(path string) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+			
+			if err := processImageAdvanced(path, 800, 600, 80); err != nil {
+				errorCount.Add(1)
+				fmt.Printf("✗ エラー: %s - %v\n", path, err)
+			} else {
+				successCount.Add(1)
+				fmt.Printf("✓ 完了: %s\n", filepath.Base(path))
+			}
+		}(filePath)
+	}
+	
+	wg.Wait()
+	
+	fmt.Printf("\n処理完了: 成功 %d, エラー %d, 所要時間: %v\n",
+		successCount.Load(), errorCount.Load(), time.Since(startTime))
+	
+	return nil
+}
+
+// パターン3: プログレスバー付き高機能版
+func ImageProcessor_WithProgress() error {
+	startTime := time.Now()
+	
+	patterns := []string{"images/*.jpg", "images/*.jpeg", "images/*.png"}
+	var allFiles []string
+	for _, pattern := range patterns {
+		if files, err := filepath.Glob(pattern); err == nil {
+			allFiles = append(allFiles, files...)
+		}
+	}
+	
+	if len(allFiles) == 0 {
+		fmt.Println("処理対象の画像が見つかりません")
+		return nil
+	}
+	
+	totalFiles := len(allFiles)
+	fmt.Printf("処理開始: %d ファイル\n", totalFiles)
+	
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, runtime.NumCPU())
+	var processedCount, errorCount atomic.Int64
+	
+	if err := os.MkdirAll("processed", 0755); err != nil {
+		return fmt.Errorf("出力ディレクトリ作成エラー: %w", err)
+	}
+	
+	// プログレス表示用goroutine
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		
+		for {
+			select {
+			case <-ticker.C:
+				processed := processedCount.Load() + errorCount.Load()
+				progress := float64(processed) / float64(totalFiles) * 100
+				fmt.Printf("\r進捗: %.1f%% (%d/%d) ", progress, processed, totalFiles)
+			case <-done:
+				fmt.Printf("\r進捗: 100.0%% (%d/%d)\n", totalFiles, totalFiles)
+				return
+			}
+		}
+	}()
+	
+	for _, filePath := range allFiles {
+		wg.Add(1)
+		semaphore <- struct{}{}
+		
+		go func(path string) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+			
+			if err := processImageAdvanced(path, 800, 600, 85); err != nil {
+				errorCount.Add(1)
+			} else {
+				processedCount.Add(1)
+			}
+		}(filePath)
+	}
+	
+	wg.Wait()
+	close(done)
+	time.Sleep(100 * time.Millisecond) // プログレス表示の完了を待つ
+	
+	fmt.Printf("処理完了: 成功 %d, エラー %d, 所要時間: %v\n",
+		processedCount.Load(), errorCount.Load(), time.Since(startTime))
+	
+	return nil
+}
+
+// 基本的な画像処理関数
+func processImage(filePath string) error {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return
+		return fmt.Errorf("ファイル開けません: %w", err)
 	}
 	defer file.Close()
 	
 	// 画像デコード
 	img, format, err := image.Decode(file)
 	if err != nil {
-		return
+		return fmt.Errorf("デコードエラー: %w", err)
 	}
 	
-	// リサイズ処理（例）
+	// リサイズ処理
 	resized := resizeImage(img, 800, 600)
 	
-	// 新しいファイルに保存
-	outputPath := fmt.Sprintf("processed_%s", filepath.Base(filePath))
+	// 出力ファイルパス
+	outputPath := filepath.Join("processed", filepath.Base(filePath))
 	outputFile, err := os.Create(outputPath)
 	if err != nil {
-		return
+		return fmt.Errorf("出力ファイル作成エラー: %w", err)
 	}
 	defer outputFile.Close()
 	
+	// フォーマットに応じてエンコード
 	switch format {
 	case "jpeg":
-		jpeg.Encode(outputFile, resized, &jpeg.Options{Quality: 80})
+		if err := jpeg.Encode(outputFile, resized, &jpeg.Options{Quality: 80}); err != nil {
+			return fmt.Errorf("JPEG エンコードエラー: %w", err)
+		}
 	case "png":
-		png.Encode(outputFile, resized)
+		if err := png.Encode(outputFile, resized); err != nil {
+			return fmt.Errorf("PNG エンコードエラー: %w", err)
+		}
+	default:
+		return fmt.Errorf("未対応のフォーマット: %s", format)
 	}
 	
-	fmt.Printf("画像処理完了: %s\n", filePath)
+	return nil
 }
 
-func resizeImage(src image.Image, width, height int) image.Image {
-	// 簡単なリサイズ実装（実際にはサードパーティライブラリを使用）
-	return src // 簡略化
-}
+// 高機能な画像処理関数
+func processImageAdvanced(filePath string, width, height, quality int) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("ファイル開けません: %w", err)
+	}
+	defer file.Close()
+	
+	// 画像デコード（フォーマット自動判定）
+	img, format, err := image.Decode(file)
+	if err != nil {
+		return fmt.Errorf("デコードエラー: %w", err)
+	}
+	
+	// 元の画像サイズを取得
+	bounds := img.Bounds()
+	originalWidth := bounds.Dx()
+	originalHeight := bounds.Dy()
+	
+	// リサイズが必要か判定
+	var resized image.Image
+	if originalWidth > width || originalHeight > height {
+		resized = resizeImage(img, width, height)
+	} else {
+		resized = img // リサイズ不要
+	}
+	
+	// 出力ファイル名を生成
+	ext := filepath.Ext(filePath)
+	baseName := filepath.Base(filePath[:len(filePath)-len(ext)])
+	outputPath := filepath.Join("processed", fmt.Sprintf("%s_processed%s", baseName, ext))
+	
+	outputFile, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("出力ファイル作成エラー: %w", err)
+	}
+	defer outputFile.Close()
+	
+	// フォーマットに応じてエンコード
+	switch format {
+	case "jpeg", "jpg":
+		if err := jpeg.Encode(outputFile, resized, &jpeg.Options{Quality: quality}); err != nil {
+			return fmt.Errorf("JPEG エンコードエラー: %w", err)
+		}
+	case "png":
+		encoder := png.Encoder{CompressionLevel: png.BestCompression}
+		if err := encoder.Encode(outputFile, resized); err != nil {
+			return fmt.Errorf("PNG エンコードエラー: %w", err)
+		}
+	default:
+		return fmt.Errorf("未対応のフォーマット: %s", format)
+	}
+	
+	return nil

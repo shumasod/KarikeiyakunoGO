@@ -1,57 +1,125 @@
-// 1. 大量ファイル並行処理バッチ
-package main
-
-import (
-	"fmt"
-	"io/fs"
-	"os"
-	"path/filepath"
-	"runtime"
-	"sync"
-	"time"
-)
-
-func sample1_FileProcessor() {
+func FileProcessor_WithErrorHandling() error {
 	startTime := time.Now()
 	
-	// ワーカープール設定
 	numWorkers := runtime.NumCPU()
 	filesChan := make(chan string, 100)
+	errorsChan := make(chan error, 100)
 	var wg sync.WaitGroup
+	var processedCount atomic.Int64
+	
+	// エラー収集用goroutine
+	var errorWg sync.WaitGroup
+	errorWg.Add(1)
+	var errors []error
+	go func() {
+		defer errorWg.Done()
+		for err := range errorsChan {
+			errors = append(errors, err)
+			fmt.Printf("Error: %v\n", err)
+		}
+	}()
 	
 	// ワーカー起動
 	for i := 0; i < numWorkers; i++ {
-		go func() {
-			for filePath := range filesChan {
-				processFile(filePath)
-				wg.Done()
-			}
-		}()
-	}
-	
-	// ファイル収集と処理
-	err := filepath.WalkDir("./data", func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
 		wg.Add(1)
-		filesChan <- path
-		return nil
-	})
-	
-	if err != nil {
-		fmt.Printf("Error walking directory: %v\n", err)
+		go func(workerID int) {
+			defer wg.Done()
+			for filePath := range filesChan {
+				if err := processFileReturningError(filePath); err != nil {
+					errorsChan <- fmt.Errorf("worker %d: %w", workerID, err)
+				} else {
+					processedCount.Add(1)
+				}
+			}
+		}(i)
 	}
 	
-	close(filesChan)
-	wg.Wait()
+	// ファイル収集
+	go func() {
+		err := filepath.WalkDir("./data", func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				errorsChan <- fmt.Errorf("walk error at %s: %w", path, err)
+				return nil
+			}
+			if d.IsDir() {
+				return nil
+			}
+			
+			select {
+			case filesChan <- path:
+			case <-time.After(5 * time.Second):
+				errorsChan <- fmt.Errorf("timeout sending file: %s", path)
+			}
+			
+			return nil
+		})
+		
+		if err != nil {
+			errorsChan <- fmt.Errorf("WalkDir failed: %w", err)
+		}
+		close(filesChan)
+	}()
 	
-	fmt.Printf("処理完了: %v\n", time.Since(startTime))
+	wg.Wait()
+	close(errorsChan)
+	errorWg.Wait()
+	
+	fmt.Printf("処理完了: 成功 %d ファイル, エラー %d件, 所要時間: %v\n",
+		processedCount.Load(), len(errors), time.Since(startTime))
+	
+	if len(errors) > 0 {
+		return fmt.Errorf("処理中に %d 件のエラーが発生しました", len(errors))
+	}
+	return nil
 }
 
+// ヘルパー関数
 func processFile(filePath string) {
-	// ファイル処理ロジック（例：サイズ計算、形式変換等）
 	if info, err := os.Stat(filePath); err == nil {
-		fmt.Printf("処理済み: %s (%d bytes)\n", filePath, info.Size())
+		// ここで実際の処理を行う（例: 圧縮、変換、分析など）
+		time.Sleep(10 * time.Millisecond) // 処理のシミュレーション
+		fmt.Printf("✓ 処理済み: %s (%d bytes)\n", filePath, info.Size())
+	}
+}
+
+func processFileWithError(filePath string) bool {
+	info, err := os.Stat(filePath)
+	if err != nil {
+		fmt.Printf("✗ エラー: %s - %v\n", filePath, err)
+		return false
+	}
+	
+	// 実際の処理
+	time.Sleep(10 * time.Millisecond)
+	fmt.Printf("✓ 処理済み: %s (%d bytes)\n", filePath, info.Size())
+	return true
+}
+
+func processFileReturningError(filePath string) error {
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return fmt.Errorf("stat failed for %s: %w", filePath, err)
+	}
+	
+	// 実際の処理
+	time.Sleep(10 * time.Millisecond)
+	fmt.Printf("✓ 処理済み: %s (%d bytes)\n", filePath, info.Size())
+	return nil
+}
+
+// メイン関数（テスト用）
+func main() {
+	// データディレクトリを作成（テスト用）
+	os.MkdirAll("./data", 0755)
+	
+	fmt.Println("=== パターン1: ワーカープール方式 ===")
+	FileProcessor_WorkerPool()
+	
+	fmt.Println("\n=== パターン2: セマフォ方式 ===")
+	FileProcessor_Semaphore()
+	
+	fmt.Println("\n=== パターン3: エラーハンドリング強化版 ===")
+	if err := FileProcessor_WithErrorHandling(); err != nil {
+		fmt.Printf("処理失敗: %v\n", err)
 	}
 }

@@ -1,6 +1,4 @@
 
-
-```go
 package main
 
 import (
@@ -113,7 +111,7 @@ func main() {
 	}
 	evaluateProduct(customProduct)
 }
-```
+
 
 **このコードの特徴:**
 

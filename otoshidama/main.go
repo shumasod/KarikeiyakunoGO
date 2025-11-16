@@ -17,7 +17,7 @@ type OtoshidamaData struct {
 	Giver  string  `json:"giver"`
 }
 
-// 分析結果の構造体
+
 type AnalysisResult struct {
 	TotalAmount   int                `json:"total_amount"`
 	AverageAmount float64            `json:"average_amount"`

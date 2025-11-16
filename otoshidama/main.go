@@ -1,3 +1,11 @@
+コードを確認しました。以下の問題点を修正します:
+
+1. **`rand.Seed()`の非推奨な使い方** - Go 1.20以降では`rand.Seed()`は非推奨で、毎回呼び出すのも非効率
+1. **乱数生成器の初期化位置** - 関数内で毎回`Seed`を呼ぶのではなく、グローバルに初期化すべき
+
+修正版:
+
+```go
 package main
 
 import (
@@ -5,19 +13,18 @@ import (
 	"fmt"
 	"html/template"
 	"log"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
-	"time"
 )
 
-
+// お年玉データの構造体
 type OtoshidamaData struct {
-	Year   int     `json:"year"`
-	Amount int     `json:"amount"`
-	Giver  string  `json:"giver"`
+	Year   int    `json:"year"`
+	Amount int    `json:"amount"`
+	Giver  string `json:"giver"`
 }
 
-
+// 分析結果の構造体
 type AnalysisResult struct {
 	TotalAmount   int                `json:"total_amount"`
 	AverageAmount float64            `json:"average_amount"`
@@ -84,9 +91,8 @@ func analyzeData(data []OtoshidamaData) AnalysisResult {
 
 // ボーナスお年玉を決定する関数
 func getBonusOtoshidama() int {
-	rand.Seed(time.Now().UnixNano())
 	bonuses := []int{1000, 2000, 3000, 5000, 10000}
-	return bonuses[rand.Intn(len(bonuses))]
+	return bonuses[rand.IntN(len(bonuses))]
 }
 
 // ホームページのハンドラ
@@ -188,7 +194,7 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
     <div class="container">
         <div class="header">
             <h1>🎍 お年玉データ分析サイト 🎍</h1>
-            <p>あなたのお年玉データを分析して、ボーナスをゲット！</p>
+            <p>あなたのお年玉データを分析して、ボーナスをゲット!</p>
         </div>
 
         <div class="card">
@@ -204,10 +210,10 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
         </div>
 
         <div class="card" style="text-align: center;">
-            <h2 style="margin-bottom: 20px;">🎁 ボーナスお年玉をもらう！</h2>
-            <p style="margin-bottom: 30px; color: #666;">データを見ると、ランダムでボーナスお年玉がもらえます！</p>
+            <h2 style="margin-bottom: 20px;">🎁 ボーナスお年玉をもらう!</h2>
+            <p style="margin-bottom: 30px; color: #666;">データを見ると、ランダムでボーナスお年玉がもらえます!</p>
             <button class="bonus-button" onclick="getBonus()">
-                <span class="emoji">🎊</span>ボーナスをもらう！
+                <span class="emoji">🎊</span>ボーナスをもらう!
             </button>
             <div id="bonus-result" style="margin-top: 30px; font-size: 1.5em; font-weight: bold; color: #f5576c;"></div>
         </div>
@@ -233,7 +239,7 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
                 <div class="feature-item">
                     <div class="emoji">🎁</div>
                     <h3>ボーナス</h3>
-                    <p>ランダムでお年玉がもらえる！</p>
+                    <p>ランダムでお年玉がもらえる!</p>
                 </div>
             </div>
         </div>
@@ -245,9 +251,9 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
                 .then(response => response.json())
                 .then(data => {
                     const resultDiv = document.getElementById('bonus-result');
-                    resultDiv.innerHTML = '🎉 おめでとうございます！<br>' + data.amount.toLocaleString() + '円のボーナスをゲット！';
+                    resultDiv.innerHTML = '🎉 おめでとうございます!<br>' + data.amount.toLocaleString() + '円のボーナスをゲット!';
                     
-                    // 紙吹雪アニメーション（簡易版）
+                    // 紙吹雪アニメーション(簡易版)
                     for (let i = 0; i < 30; i++) {
                         createConfetti();
                     }
@@ -497,9 +503,18 @@ func main() {
 	port := ":8080"
 	fmt.Printf("🚀 サーバーを起動しています...\n")
 	fmt.Printf("🌐 ブラウザで http://localhost%s にアクセスしてください\n", port)
-	fmt.Printf("📊 お年玉データ分析サイトへようこそ！\n\n")
+	fmt.Printf("📊 お年玉データ分析サイトへようこそ!\n\n")
 
 	if err := http.ListenAndServe(port, nil); err != nil {
 		log.Fatal(err)
 	}
 }
+```
+
+## 主な修正点
+
+1. **`math/rand`を`math/rand/v2`に変更** - Go 1.22以降の新しいrandパッケージを使用
+1. **`rand.Seed()`を削除** - v2では不要(自動的にランダムシード)
+1. **`rand.Intn()`を`rand.IntN()`に変更** - v2の新しいAPI
+
+これでより安全で現代的なGoコードになりました!​​​​​​​​​​

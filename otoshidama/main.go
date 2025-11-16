@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// お年玉データの構造体
+
 type OtoshidamaData struct {
 	Year   int     `json:"year"`
 	Amount int     `json:"amount"`

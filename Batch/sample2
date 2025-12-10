@@ -1,64 +1,247 @@
+// Package jsonstream provides concurrent JSON line processing.
+package jsonstream
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"runtime"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
-type Record struct {
-	ID       int    `json:"id"`
-	Name     string `json:"name"`
-	Email    string `json:"email"`
-	Score    float64 `json:"score"`
+// =============================================================================
+// Types
+// =============================================================================
+
+// TransformFunc transforms a record, returning nil to filter it out.
+type TransformFunc[T any] func(record T) (*T, error)
+
+// Config holds processor configuration.
+type Config struct {
+	NumWorkers    int
+	BufferSize    int
+	MaxLineSize   int
+	ContinueOnErr bool
 }
 
-func sample2_JSONProcessor() {
-	file, err := os.Open("large_data.json")
-	if err != nil {
-		panic(err)
-	}
-	defer file.Close()
-	
-	scanner := bufio.NewScanner(file)
-	recordsChan := make(chan Record, 1000)
-	resultsChan := make(chan Record, 1000)
-	
-	var wg sync.WaitGroup
-	numWorkers := runtime.NumCPU()
-	
-	// JSON処理ワーカー
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for record := range recordsChan {
-				// 処理ロジック（例：スコア正規化、データ検証）
-				if record.Score > 0 {
-					record.Score = record.Score / 100.0
-					resultsChan <- record
-				}
-			}
-		}()
-	}
-	
-	// JSON読み込み
-	go func() {
-		defer close(recordsChan)
-		for scanner.Scan() {
-			var record Record
-			if err := json.Unmarshal(scanner.Bytes(), &record); err == nil {
-				recordsChan <- record
-			}
-		}
-	}()
-	
-	go func() {
-		wg.Wait()
-		close(resultsChan)
-	}()
-	
-	// 結果収集
-	for processedRecord := range resultsChan {
-		fmt.Printf("処理済み: %+v\n", processedRecord)
+// DefaultConfig returns sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		NumWorkers:    runtime.NumCPU(),
+		BufferSize:    1000,
+		MaxLineSize:   10 * 1024 * 1024, // 10MB
+		ContinueOnErr: true,
 	}
 }
+
+// Stats holds processing statistics.
+type Stats struct {
+	Read      int64
+	Processed int64
+	Filtered  int64
+	Errors    int64
+	Duration  time.Duration
+}
+
+func (s Stats) String() string {
+	return fmt.Sprintf(
+		"読込: %d, 処理: %d, 除外: %d, エラー: %d, 所要時間: %v",
+		s.Read, s.Processed, s.Filtered, s.Errors,
+		s.Duration.Round(time.Millisecond),
+	)
+}
+
+// =============================================================================
+// Processor
+// =============================================================================
+
+// Processor handles concurrent JSON line processing.
+type Processor[T any] struct {
+	config    Config
+	transform TransformFunc[T]
+
+	read      atomic.Int64
+	processed atomic.Int64
+	filtered  atomic.Int64
+	errors    atomic.Int64
+}
+
+// New creates a new Processor.
+func New[T any](cfg Config, transform TransformFunc[T]) *Processor[T] {
+	if cfg.NumWorkers <= 0 {
+		cfg.NumWorkers = runtime.NumCPU()
+	}
+	if cfg.BufferSize <= 0 {
+		cfg.BufferSize = 1000
+	}
+	if cfg.MaxLineSize <= 0 {
+		cfg.MaxLineSize = 10 * 1024 * 1024
+	}
+
+	return &Processor[T]{
+		config:    cfg,
+		transform: transform,
+	}
+}
+
+// Process reads from reader and returns processed results.
+func (p *Processor[T]) Process(ctx context.Context, reader io.Reader) (<-chan T, <-chan error) {
+	inputChan := make(chan T, p.config.BufferSize)
+	outputChan := make(chan T, p.config.BufferSize)
+	errChan := make(chan error, p.config.BufferSize)
+
+	var wg sync.WaitGroup
+
+	// Start workers
+	for i := 0; i < p.config.NumWorkers; i++ {
+		wg.Add(1)
+		go p.worker(ctx, inputChan, outputChan, errChan, &wg)
+	}
+
+	// Start reader
+	go p.readLines(ctx, reader, inputChan, errChan)
+
+	// Close output when done
+	go func() {
+		wg.Wait()
+		close(outputChan)
+		close(errChan)
+	}()
+
+	return outputChan, errChan
+}
+
+// ProcessFile is a convenience method for file processing.
+func (p *Processor[T]) ProcessFile(ctx context.Context, path string) (<-chan T, <-chan error, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open file: %w", err)
+	}
+
+	outputChan, errChan := p.Process(ctx, file)
+
+	// Wrap output to close file when done
+	wrappedOutput := make(chan T, p.config.BufferSize)
+	go func() {
+		defer file.Close()
+		for record := range outputChan {
+			wrappedOutput <- record
+		}
+		close(wrappedOutput)
+	}()
+
+	return wrappedOutput, errChan, nil
+}
+
+// Stats returns current processing statistics.
+func (p *Processor[T]) Stats() Stats {
+	return Stats{
+		Read:      p.read.Load(),
+		Processed: p.processed.Load(),
+		Filtered:  p.filtered.Load(),
+		Errors:    p.errors.Load(),
+	}
+}
+
+func (p *Processor[T]) worker(
+	ctx context.Context,
+	input <-chan T,
+	output chan<- T,
+	errChan chan<- error,
+	wg *sync.WaitGroup,
+) {
+	defer wg.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case record, ok := <-input:
+			if !ok {
+				return
+			}
+			p.processRecord(ctx, record, output, errChan)
+		}
+	}
+}
+
+func (p *Processor[T]) processRecord(
+	ctx context.Context,
+	record T,
+	output chan<- T,
+	errChan chan<- error,
+) {
+	result, err := p.transform(record)
+	if err != nil {
+		p.errors.Add(1)
+		select {
+		case errChan <- fmt.Errorf("transform: %w", err):
+		default:
+		}
+		return
+	}
+
+	if result == nil {
+		p.filtered.Add(1)
+		return
+	}
+
+	p.processed.Add(1)
+
+	select {
+	case <-ctx.Done():
+	case output <- *result:
+	}
+}
+
+func (p *Processor[T]) readLines(
+	ctx context.Context,
+	reader io.Reader,
+	output chan<- T,
+	errChan chan<- error,
+) {
+	defer close(output)
+
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), p.config.MaxLineSize)
+
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		var record T
+		if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
+			p.errors.Add(1)
+			if !p.config.ContinueOnErr {
+				errChan <- fmt.Errorf("line %d: %w", lineNum, err)
+				return
+			}
+			select {
+			case errChan <- fmt.Errorf("line %d: %w", lineNum, err):
+			default:
+			}
+			continue
+		}
+
+		p.read.Add(1)
+
+		select {
+		case <-ctx.Done():
+			return
+		case output <- record:
+		}
+	}
+
+	if err := scanner.Err(); err != nil {

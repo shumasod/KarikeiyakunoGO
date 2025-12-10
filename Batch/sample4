@@ -1,79 +1,167 @@
-// 4. HTTP並行リクエスト処理バッチ
+package main
+
 import (
-	"io"
-	"net/http"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/signal"
+	"time"
+
+	hb "yourmodule/httpbatch"
 )
 
-type APIResponse struct {
-	URL    string
-	Status int
-	Body   string
-	Error  error
+func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	// Example 1: Simple URL fetching
+	fmt.Println("=== シンプルなURL取得 ===")
+	simpleExample(ctx)
+
+	// Example 2: With options
+	fmt.Println("\n=== オプション付き ===")
+	optionsExample(ctx)
+
+	// Example 3: Custom requests
+	fmt.Println("\n=== カスタムリクエスト ===")
+	customRequestsExample(ctx)
+
+	// Example 4: With handler
+	fmt.Println("\n=== ハンドラー付き ===")
+	handlerExample(ctx)
 }
 
-func sample4_HTTPBatchProcessor() {
-	urls := generateURLs(1000) // 1000個のURL
-	
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-	
-	requestsChan := make(chan string, len(urls))
-	responsesChan := make(chan APIResponse, len(urls))
-	
-	var wg sync.WaitGroup
-	numWorkers := 50 // 並行リクエスト数
-	
-	// HTTP リクエストワーカー
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for url := range requestsChan {
-				resp, err := client.Get(url)
-				result := APIResponse{URL: url, Error: err}
-				
-				if err == nil {
-					result.Status = resp.StatusCode
-					body, _ := io.ReadAll(resp.Body)
-					result.Body = string(body)
-					resp.Body.Close()
-				}
-				
-				responsesChan <- result
-			}
-		}()
-	}
-	
-	// URL送信
-	go func() {
-		for _, url := range urls {
-			requestsChan <- url
-		}
-		close(requestsChan)
-	}()
-	
-	// レスポンス処理
-	go func() {
-		wg.Wait()
-		close(responsesChan)
-	}()
-	
+func simpleExample(ctx context.Context) {
+	urls := generateURLs(100)
+
+	responses, stats := hb.Get(ctx, urls,
+		hb.WithConcurrency(20),
+		hb.WithTimeout(5*time.Second),
+	)
+
+	fmt.Printf("取得完了: %d件\n", len(responses))
+	fmt.Println(stats)
+}
+
+func optionsExample(ctx context.Context) {
+	urls := generateURLs(50)
+
+	responses, stats := hb.Get(ctx, urls,
+		hb.WithConcurrency(10),
+		hb.WithTimeout(10*time.Second),
+		hb.WithRetry(3, 500*time.Millisecond),
+		hb.WithRateLimit(50*time.Millisecond), // 20 req/sec
+		hb.WithUserAgent("MyApp/1.0"),
+	)
+
 	successCount := 0
-	for response := range responsesChan {
-		if response.Error == nil && response.Status == 200 {
+	for _, r := range responses {
+		if r.IsSuccess() {
 			successCount++
 		}
-		fmt.Printf("処理完了: %s (Status: %d)\n", response.URL, response.Status)
 	}
-	
+
 	fmt.Printf("成功: %d/%d\n", successCount, len(urls))
+	fmt.Println(stats)
+}
+
+func customRequestsExample(ctx context.Context) {
+	requests := []hb.Request{
+		{
+			ID:     "user-1",
+			Method: "GET",
+			URL:    "https://api.example.com/users/1",
+			Headers: map[string]string{
+				"Authorization": "Bearer token123",
+				"Accept":        "application/json",
+			},
+		},
+		{
+			ID:     "user-2",
+			Method: "GET",
+			URL:    "https://api.example.com/users/2",
+			Headers: map[string]string{
+				"Authorization": "Bearer token123",
+				"Accept":        "application/json",
+			},
+		},
+	}
+
+	cfg := hb.DefaultConfig()
+	cfg.MaxConcurrency = 5
+	cfg.Timeout = 15 * time.Second
+
+	processor := hb.New(cfg)
+	responseChan := processor.Process(ctx, requests)
+
+	for resp := range responseChan {
+		if resp.IsSuccess() {
+			fmt.Printf("✓ %s: %d bytes in %v\n",
+				resp.Request.ID, len(resp.Body), resp.Duration)
+		} else {
+			fmt.Printf("✗ %s: %v\n", resp.Request.ID, resp.Error)
+		}
+	}
+
+	fmt.Println(processor.Stats())
+}
+
+func handlerExample(ctx context.Context) {
+	urls := generateURLs(30)
+
+	requests := make([]hb.Request, len(urls))
+	for i, url := range urls {
+		requests[i] = hb.Request{
+			ID:     fmt.Sprintf("req-%d", i),
+			Method: "GET",
+			URL:    url,
+		}
+	}
+
+	cfg := hb.DefaultConfig()
+	cfg.MaxConcurrency = 10
+
+	processor := hb.New(cfg)
+
+	// Process with inline handler
+	var results []APIData
+	var mu sync.Mutex
+
+	stats := processor.ProcessWithHandler(ctx, requests, func(resp hb.Response) {
+		if !resp.IsSuccess() {
+			fmt.Printf("⚠ %s failed: %v\n", resp.Request.URL, resp.Error)
+			return
+		}
+
+		var data APIData
+		if err := json.Unmarshal(resp.Body, &data); err != nil {
+			fmt.Printf("⚠ JSON parse error: %v\n", err)
+			return
+		}
+
+		mu.Lock()
+		results = append(results, data)
+		mu.Unlock()
+
+		fmt.Printf("✓ Processed: %s\n", resp.Request.URL)
+	})
+
+	fmt.Printf("\n取得データ: %d件\n", len(results))
+	fmt.Println(stats)
+}
+
+type APIData struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
 }
 
 func generateURLs(count int) []string {
 	urls := make([]string, count)
-	for i := 0; i < count; i++ {
-		urls[i] = fmt.Sprintf("https://api.example.com/data/%d", i)
+	for i := range urls {
+		urls[i] = fmt.Sprintf("https://jsonplaceholder.typicode.com/posts/%d", i+1)
 	}
 	return urls
 }
+
+var mu sync.Mutex // Used in handlerExample

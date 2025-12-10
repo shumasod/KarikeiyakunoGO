@@ -1,125 +1,326 @@
-func FileProcessor_WithErrorHandling() error {
+// Package fileprocessor provides concurrent file processing utilities.
+package fileprocessor
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// =============================================================================
+// Types
+// =============================================================================
+
+// ProcessFunc defines a file processing function.
+type ProcessFunc func(ctx context.Context, path string, info fs.FileInfo) error
+
+// FilterFunc determines if a file should be processed.
+type FilterFunc func(path string, info fs.DirEntry) bool
+
+// Config holds processor configuration.
+type Config struct {
+	RootDir     string
+	NumWorkers  int
+	BufferSize  int
+	Timeout     time.Duration
+	Filter      FilterFunc
+	OnError     func(err error)
+	OnProgress  func(processed, errors int64)
+}
+
+// DefaultConfig returns sensible defaults.
+func DefaultConfig(rootDir string) Config {
+	return Config{
+		RootDir:    rootDir,
+		NumWorkers: runtime.NumCPU(),
+		BufferSize: 100,
+		Timeout:    30 * time.Second,
+		Filter:     func(_ string, d fs.DirEntry) bool { return !d.IsDir() },
+	}
+}
+
+// Stats holds processing statistics.
+type Stats struct {
+	Processed   int64
+	Errors      int64
+	TotalFiles  int64
+	Duration    time.Duration
+	ErrorList   []error
+}
+
+// String returns a human-readable summary.
+func (s Stats) String() string {
+	return fmt.Sprintf(
+		"処理完了: 成功 %d, エラー %d, 合計 %d, 所要時間 %v",
+		s.Processed, s.Errors, s.TotalFiles, s.Duration.Round(time.Millisecond),
+	)
+}
+
+// =============================================================================
+// Processor
+// =============================================================================
+
+// Processor handles concurrent file processing.
+type Processor struct {
+	config  Config
+	process ProcessFunc
+
+	// internal state
+	filesChan  chan string
+	errorsChan chan error
+	wg         sync.WaitGroup
+	errorWg    sync.WaitGroup
+
+	processed atomic.Int64
+	errCount  atomic.Int64
+	total     atomic.Int64
+
+	errorsMu sync.Mutex
+	errors   []error
+}
+
+// New creates a new Processor.
+func New(cfg Config, fn ProcessFunc) *Processor {
+	if cfg.NumWorkers <= 0 {
+		cfg.NumWorkers = runtime.NumCPU()
+	}
+	if cfg.BufferSize <= 0 {
+		cfg.BufferSize = 100
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 30 * time.Second
+	}
+
+	return &Processor{
+		config:     cfg,
+		process:    fn,
+		filesChan:  make(chan string, cfg.BufferSize),
+		errorsChan: make(chan error, cfg.BufferSize),
+	}
+}
+
+// Run executes the file processing with the given context.
+func (p *Processor) Run(ctx context.Context) (Stats, error) {
 	startTime := time.Now()
-	
-	numWorkers := runtime.NumCPU()
-	filesChan := make(chan string, 100)
-	errorsChan := make(chan error, 100)
-	var wg sync.WaitGroup
-	var processedCount atomic.Int64
-	
-	// エラー収集用goroutine
-	var errorWg sync.WaitGroup
-	errorWg.Add(1)
-	var errors []error
-	go func() {
-		defer errorWg.Done()
-		for err := range errorsChan {
-			errors = append(errors, err)
-			fmt.Printf("Error: %v\n", err)
-		}
-	}()
-	
-	// ワーカー起動
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			for filePath := range filesChan {
-				if err := processFileReturningError(filePath); err != nil {
-					errorsChan <- fmt.Errorf("worker %d: %w", workerID, err)
-				} else {
-					processedCount.Add(1)
-				}
-			}
-		}(i)
+
+	// Start error collector
+	p.errorWg.Add(1)
+	go p.collectErrors()
+
+	// Start workers
+	for i := 0; i < p.config.NumWorkers; i++ {
+		p.wg.Add(1)
+		go p.worker(ctx, i)
 	}
-	
-	// ファイル収集
-	go func() {
-		err := filepath.WalkDir("./data", func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				errorsChan <- fmt.Errorf("walk error at %s: %w", path, err)
-				return nil
+
+	// Start file discovery
+	go p.discoverFiles(ctx)
+
+	// Wait for completion
+	p.wg.Wait()
+	close(p.errorsChan)
+	p.errorWg.Wait()
+
+	stats := Stats{
+		Processed:  p.processed.Load(),
+		Errors:     p.errCount.Load(),
+		TotalFiles: p.total.Load(),
+		Duration:   time.Since(startTime),
+		ErrorList:  p.errors,
+	}
+
+	if stats.Errors > 0 {
+		return stats, fmt.Errorf("処理中に %d 件のエラーが発生", stats.Errors)
+	}
+	return stats, nil
+}
+
+func (p *Processor) worker(ctx context.Context, id int) {
+	defer p.wg.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case path, ok := <-p.filesChan:
+			if !ok {
+				return
 			}
-			if d.IsDir() {
-				return nil
-			}
-			
-			select {
-			case filesChan <- path:
-			case <-time.After(5 * time.Second):
-				errorsChan <- fmt.Errorf("timeout sending file: %s", path)
-			}
-			
-			return nil
-		})
-		
+			p.processFile(ctx, id, path)
+		}
+	}
+}
+
+func (p *Processor) processFile(ctx context.Context, workerID int, path string) {
+	info, err := os.Stat(path)
+	if err != nil {
+		p.sendError(fmt.Errorf("worker %d: stat %s: %w", workerID, path, err))
+		return
+	}
+
+	// Create timeout context for individual file
+	fileCtx, cancel := context.WithTimeout(ctx, p.config.Timeout)
+	defer cancel()
+
+	if err := p.process(fileCtx, path, info); err != nil {
+		p.sendError(fmt.Errorf("worker %d: process %s: %w", workerID, path, err))
+		return
+	}
+
+	p.processed.Add(1)
+	if p.config.OnProgress != nil {
+		p.config.OnProgress(p.processed.Load(), p.errCount.Load())
+	}
+}
+
+func (p *Processor) discoverFiles(ctx context.Context) {
+	defer close(p.filesChan)
+
+	err := filepath.WalkDir(p.config.RootDir, func(path string, d fs.DirEntry, err error) error {
+		// Check context cancellation
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		if err != nil {
-			errorsChan <- fmt.Errorf("WalkDir failed: %w", err)
+			p.sendError(fmt.Errorf("walk %s: %w", path, err))
+			return nil // Continue walking
 		}
-		close(filesChan)
-	}()
-	
-	wg.Wait()
-	close(errorsChan)
-	errorWg.Wait()
-	
-	fmt.Printf("処理完了: 成功 %d ファイル, エラー %d件, 所要時間: %v\n",
-		processedCount.Load(), len(errors), time.Since(startTime))
-	
-	if len(errors) > 0 {
-		return fmt.Errorf("処理中に %d 件のエラーが発生しました", len(errors))
+
+		// Apply filter
+		if p.config.Filter != nil && !p.config.Filter(path, d) {
+			return nil
+		}
+
+		p.total.Add(1)
+
+		// Send to workers with timeout
+		select {
+		case p.filesChan <- path:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+			p.sendError(fmt.Errorf("timeout queuing: %s", path))
+		}
+
+		return nil
+	})
+
+	if err != nil && !errors.Is(err, context.Canceled) {
+		p.sendError(fmt.Errorf("walkdir: %w", err))
 	}
-	return nil
 }
 
-// ヘルパー関数
-func processFile(filePath string) {
-	if info, err := os.Stat(filePath); err == nil {
-		// ここで実際の処理を行う（例: 圧縮、変換、分析など）
-		time.Sleep(10 * time.Millisecond) // 処理のシミュレーション
-		fmt.Printf("✓ 処理済み: %s (%d bytes)\n", filePath, info.Size())
+func (p *Processor) collectErrors() {
+	defer p.errorWg.Done()
+
+	for err := range p.errorsChan {
+		p.errCount.Add(1)
+
+		p.errorsMu.Lock()
+		p.errors = append(p.errors, err)
+		p.errorsMu.Unlock()
+
+		if p.config.OnError != nil {
+			p.config.OnError(err)
+		}
 	}
 }
 
-func processFileWithError(filePath string) bool {
-	info, err := os.Stat(filePath)
-	if err != nil {
-		fmt.Printf("✗ エラー: %s - %v\n", filePath, err)
-		return false
+func (p *Processor) sendError(err error) {
+	select {
+	case p.errorsChan <- err:
+	default:
+		// Buffer full, log directly
+		if p.config.OnError != nil {
+			p.config.OnError(err)
+		}
 	}
-	
-	// 実際の処理
-	time.Sleep(10 * time.Millisecond)
-	fmt.Printf("✓ 処理済み: %s (%d bytes)\n", filePath, info.Size())
-	return true
 }
 
-func processFileReturningError(filePath string) error {
-	info, err := os.Stat(filePath)
-	if err != nil {
-		return fmt.Errorf("stat failed for %s: %w", filePath, err)
+// =============================================================================
+// Convenience Functions
+// =============================================================================
+
+// ProcessDir is a convenience function for simple use cases.
+func ProcessDir(ctx context.Context, dir string, fn ProcessFunc) (Stats, error) {
+	cfg := DefaultConfig(dir)
+	cfg.OnError = func(err error) {
+		fmt.Fprintf(os.Stderr, "エラー: %v\n", err)
 	}
-	
-	// 実際の処理
-	time.Sleep(10 * time.Millisecond)
-	fmt.Printf("✓ 処理済み: %s (%d bytes)\n", filePath, info.Size())
-	return nil
+
+	return New(cfg, fn).Run(ctx)
 }
 
-// メイン関数（テスト用）
-func main() {
-	// データディレクトリを作成（テスト用）
-	os.MkdirAll("./data", 0755)
-	
-	fmt.Println("=== パターン1: ワーカープール方式 ===")
-	FileProcessor_WorkerPool()
-	
-	fmt.Println("\n=== パターン2: セマフォ方式 ===")
-	FileProcessor_Semaphore()
-	
-	fmt.Println("\n=== パターン3: エラーハンドリング強化版 ===")
-	if err := FileProcessor_WithErrorHandling(); err != nil {
-		fmt.Printf("処理失敗: %v\n", err)
+// =============================================================================
+// Example Processors
+// =============================================================================
+
+// StatProcessor returns file statistics.
+func StatProcessor() ProcessFunc {
+	return func(ctx context.Context, path string, info fs.FileInfo) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// Simulate processing
+		time.Sleep(10 * time.Millisecond)
+		fmt.Printf("✓ %s (%d bytes)\n", path, info.Size())
+		return nil
+	}
+}
+
+// ExtensionFilter returns a filter for specific extensions.
+func ExtensionFilter(extensions ...string) FilterFunc {
+	extSet := make(map[string]struct{}, len(extensions))
+	for _, ext := range extensions {
+		extSet[ext] = struct{}{}
+	}
+
+	return func(path string, d fs.DirEntry) bool {
+		if d.IsDir() {
+			return false
+		}
+		ext := filepath.Ext(path)
+		_, ok := extSet[ext]
+		return ok
+	}
+}
+
+// SizeFilter returns a filter for files within size range.
+func SizeFilter(minBytes, maxBytes int64) FilterFunc {
+	return func(path string, d fs.DirEntry) bool {
+		if d.IsDir() {
+			return false
+		}
+		info, err := d.Info()
+		if err != nil {
+			return false
+		}
+		size := info.Size()
+		return size >= minBytes && (maxBytes <= 0 || size <= maxBytes)
+	}
+}
+
+// CombineFilters combines multiple filters with AND logic.
+func CombineFilters(filters ...FilterFunc) FilterFunc {
+	return func(path string, d fs.DirEntry) bool {
+		for _, f := range filters {
+			if !f(path, d) {
+				return false
+			}
+		}
+		return true
 	}
 }

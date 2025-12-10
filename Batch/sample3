@@ -1,73 +1,379 @@
-// 3. データベース一括更新バッチ
+// Package batchdb provides concurrent database batch operations.
+package batchdb
+
 import (
+	"context"
 	"database/sql"
-	_ "github.com/lib/pq"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
-func sample3_DatabaseBatchUpdate() {
-	db, err := sql.Open("postgres", "postgres://user:pass@localhost/db")
-	if err != nil {
-		panic(err)
+// =============================================================================
+// Types
+// =============================================================================
+
+// BatchFunc executes a batch operation within a transaction.
+type BatchFunc[T any] func(ctx context.Context, tx *sql.Tx, batch []T) error
+
+// Config holds batch processor configuration.
+type Config struct {
+	BatchSize      int
+	MaxConcurrency int
+	RetryAttempts  int
+	RetryDelay     time.Duration
+	OnProgress     func(completed, total int)
+}
+
+// DefaultConfig returns sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BatchSize:      1000,
+		MaxConcurrency: 10,
+		RetryAttempts:  3,
+		RetryDelay:     100 * time.Millisecond,
 	}
-	defer db.Close()
-	
-	// バッチサイズ設定
-	batchSize := 1000
-	records := generateRecords(100000) // 10万件のテストデータ
-	
+}
+
+// Stats holds processing statistics.
+type Stats struct {
+	TotalRecords   int
+	TotalBatches   int
+	Succeeded      int64
+	Failed         int64
+	Retried        int64
+	Duration       time.Duration
+}
+
+func (s Stats) String() string {
+	successRate := float64(0)
+	if s.TotalBatches > 0 {
+		successRate = float64(s.Succeeded) / float64(s.TotalBatches) * 100
+	}
+	return fmt.Sprintf(
+		"レコード: %d, バッチ: %d, 成功: %d, 失敗: %d, リトライ: %d, 成功率: %.1f%%, 所要時間: %v",
+		s.TotalRecords, s.TotalBatches, s.Succeeded, s.Failed, s.Retried,
+		successRate, s.Duration.Round(time.Millisecond),
+	)
+}
+
+// BatchError holds information about a failed batch.
+type BatchError struct {
+	BatchIndex int
+	StartIndex int
+	EndIndex   int
+	Err        error
+}
+
+func (e BatchError) Error() string {
+	return fmt.Sprintf("batch %d (records %d-%d): %v", e.BatchIndex, e.StartIndex, e.EndIndex, e.Err)
+}
+
+// Result holds the complete processing result.
+type Result struct {
+	Stats  Stats
+	Errors []BatchError
+}
+
+// =============================================================================
+// Processor
+// =============================================================================
+
+// Processor handles concurrent batch database operations.
+type Processor[T any] struct {
+	db      *sql.DB
+	config  Config
+	batchFn BatchFunc[T]
+
+	succeeded atomic.Int64
+	failed    atomic.Int64
+	retried   atomic.Int64
+
+	errorsMu sync.Mutex
+	errors   []BatchError
+}
+
+// New creates a new batch Processor.
+func New[T any](db *sql.DB, cfg Config, fn BatchFunc[T]) *Processor[T] {
+	if cfg.BatchSize <= 0 {
+		cfg.BatchSize = 1000
+	}
+	if cfg.MaxConcurrency <= 0 {
+		cfg.MaxConcurrency = 10
+	}
+	if cfg.RetryAttempts <= 0 {
+		cfg.RetryAttempts = 1
+	}
+
+	return &Processor[T]{
+		db:      db,
+		config:  cfg,
+		batchFn: fn,
+	}
+}
+
+// Process executes batch operations on all records.
+func (p *Processor[T]) Process(ctx context.Context, records []T) Result {
+	startTime := time.Now()
+
+	batches := p.createBatches(records)
+	totalBatches := len(batches)
+
 	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, 10) // 同時実行数制限
-	
-	for i := 0; i < len(records); i += batchSize {
-		end := i + batchSize
+	semaphore := make(chan struct{}, p.config.MaxConcurrency)
+
+	for i, batch := range batches {
+		select {
+		case <-ctx.Done():
+			break
+		case semaphore <- struct{}{}:
+		}
+
+		wg.Add(1)
+		go func(index int, b batchInfo[T]) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+
+			p.processBatch(ctx, index, b)
+
+			if p.config.OnProgress != nil {
+				completed := int(p.succeeded.Load() + p.failed.Load())
+				p.config.OnProgress(completed, totalBatches)
+			}
+		}(i, batch)
+	}
+
+	wg.Wait()
+
+	return Result{
+		Stats: Stats{
+			TotalRecords: len(records),
+			TotalBatches: totalBatches,
+			Succeeded:    p.succeeded.Load(),
+			Failed:       p.failed.Load(),
+			Retried:      p.retried.Load(),
+			Duration:     time.Since(startTime),
+		},
+		Errors: p.errors,
+	}
+}
+
+type batchInfo[T any] struct {
+	data       []T
+	startIndex int
+	endIndex   int
+}
+
+func (p *Processor[T]) createBatches(records []T) []batchInfo[T] {
+	var batches []batchInfo[T]
+
+	for i := 0; i < len(records); i += p.config.BatchSize {
+		end := i + p.config.BatchSize
 		if end > len(records) {
 			end = len(records)
 		}
-		
-		batch := records[i:end]
-		wg.Add(1)
-		semaphore <- struct{}{}
-		
-		go func(batch []Record) {
-			defer wg.Done()
-			defer func() { <-semaphore }()
-			
-			tx, err := db.Begin()
-			if err != nil {
-				fmt.Printf("Transaction error: %v\n", err)
-				return
-			}
-			
-			stmt, err := tx.Prepare("UPDATE users SET score = $1 WHERE id = $2")
-			if err != nil {
-				tx.Rollback()
-				return
-			}
-			defer stmt.Close()
-			
-			for _, record := range batch {
-				if _, err := stmt.Exec(record.Score, record.ID); err != nil {
-					fmt.Printf("Update error: %v\n", err)
-				}
-			}
-			
-			tx.Commit()
-			fmt.Printf("バッチ更新完了: %d件\n", len(batch))
-		}(batch)
+
+		batches = append(batches, batchInfo[T]{
+			data:       records[i:end],
+			startIndex: i,
+			endIndex:   end - 1,
+		})
 	}
-	
-	wg.Wait()
+
+	return batches
 }
 
-func generateRecords(count int) []Record {
-	records := make([]Record, count)
-	for i := 0; i < count; i++ {
-		records[i] = Record{
-			ID:    i + 1,
-			Name:  fmt.Sprintf("User%d", i),
-			Email: fmt.Sprintf("user%d@example.com", i),
-			Score: float64(i % 100),
+func (p *Processor[T]) processBatch(ctx context.Context, index int, batch batchInfo[T]) {
+	var lastErr error
+
+	for attempt := 0; attempt < p.config.RetryAttempts; attempt++ {
+		if attempt > 0 {
+			p.retried.Add(1)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(p.config.RetryDelay * time.Duration(attempt)):
+			}
+		}
+
+		if err := p.executeBatch(ctx, batch.data); err != nil {
+			lastErr = err
+			continue
+		}
+
+		p.succeeded.Add(1)
+		return
+	}
+
+	p.failed.Add(1)
+	p.addError(BatchError{
+		BatchIndex: index,
+		StartIndex: batch.startIndex,
+		EndIndex:   batch.endIndex,
+		Err:        lastErr,
+	})
+}
+
+func (p *Processor[T]) executeBatch(ctx context.Context, batch []T) error {
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
+
+	if err := p.batchFn(ctx, tx, batch); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+
+	committed = true
+	return nil
+}
+
+func (p *Processor[T]) addError(err BatchError) {
+	p.errorsMu.Lock()
+	defer p.errorsMu.Unlock()
+	p.errors = append(p.errors, err)
+}
+
+// =============================================================================
+// Batch Functions
+// =============================================================================
+
+// UpdateFunc creates a batch function for UPDATE operations.
+func UpdateFunc[T any](query string, argsFn func(T) []any) BatchFunc[T] {
+	return func(ctx context.Context, tx *sql.Tx, batch []T) error {
+		stmt, err := tx.PrepareContext(ctx, query)
+		if err != nil {
+			return fmt.Errorf("prepare: %w", err)
+		}
+		defer stmt.Close()
+
+		for _, record := range batch {
+			if _, err := stmt.ExecContext(ctx, argsFn(record)...); err != nil {
+				return fmt.Errorf("exec: %w", err)
+			}
+		}
+
+		return nil
+	}
+}
+
+// InsertFunc creates a batch function for INSERT operations.
+func InsertFunc[T any](query string, argsFn func(T) []any) BatchFunc[T] {
+	return UpdateFunc(query, argsFn)
+}
+
+// BulkInsertFunc creates a batch function using multi-row INSERT.
+func BulkInsertFunc[T any](
+	baseQuery string,
+	valuePlaceholder string,
+	argsFn func(T) []any,
+) BatchFunc[T] {
+	return func(ctx context.Context, tx *sql.Tx, batch []T) error {
+		if len(batch) == 0 {
+			return nil
+		}
+
+		// Build query with multiple value placeholders
+		query := baseQuery
+		args := make([]any, 0, len(batch)*len(argsFn(batch[0])))
+
+		for i, record := range batch {
+			if i > 0 {
+				query += ","
+			}
+			recordArgs := argsFn(record)
+			// Adjust placeholder numbers for PostgreSQL
+			placeholder := adjustPlaceholders(valuePlaceholder, len(recordArgs), i)
+			query += placeholder
+			args = append(args, recordArgs...)
+		}
+
+		_, err := tx.ExecContext(ctx, query, args...)
+		return err
+	}
+}
+
+func adjustPlaceholders(template string, argsPerRecord, recordIndex int) string {
+	// Simple placeholder adjustment for PostgreSQL ($1, $2, etc.)
+	result := template
+	offset := recordIndex * argsPerRecord
+	for i := argsPerRecord; i >= 1; i-- {
+		old := fmt.Sprintf("$%d", i)
+		new := fmt.Sprintf("$%d", i+offset)
+		result = replaceFirst(result, old, new)
+	}
+	return result
+}
+
+func replaceFirst(s, old, new string) string {
+	for i := 0; i <= len(s)-len(old); i++ {
+		if s[i:i+len(old)] == old {
+			return s[:i] + new + s[i+len(old):]
 		}
 	}
-	return records
+	return s
+}
+
+// DeleteFunc creates a batch function for DELETE operations.
+func DeleteFunc[T any](query string, argsFn func(T) []any) BatchFunc[T] {
+	return UpdateFunc(query, argsFn)
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+// ProcessWithRetry processes records with automatic retry on failure.
+func ProcessWithRetry[T any](
+	ctx context.Context,
+	db *sql.DB,
+	records []T,
+	fn BatchFunc[T],
+	opts ...Option,
+) Result {
+	cfg := DefaultConfig()
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	return New(db, cfg, fn).Process(ctx, records)
+}
+
+// Option configures the processor.
+type Option func(*Config)
+
+// WithBatchSize sets the batch size.
+func WithBatchSize(size int) Option {
+	return func(c *Config) { c.BatchSize = size }
+}
+
+// WithConcurrency sets the max concurrency.
+func WithConcurrency(n int) Option {
+	return func(c *Config) { c.MaxConcurrency = n }
+}
+
+// WithRetry sets retry configuration.
+func WithRetry(attempts int, delay time.Duration) Option {
+	return func(c *Config) {
+		c.RetryAttempts = attempts
+		c.RetryDelay = delay
+	}
+}
+
+// WithProgress sets the progress callback.
+func WithProgress(fn func(completed, total int)) Option {
+	return func(c *Config) { c.OnProgress = fn }
 }

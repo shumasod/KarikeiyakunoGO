@@ -1,0 +1,17 @@
+# Compiled binaries
+garapon/garapon
+otoshidama/otoshidama
+
+# Go build output
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go test output
+*.test
+
+# Go workspace file
+go.work
+go.work.sum

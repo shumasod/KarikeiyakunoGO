@@ -1,0 +1,19 @@
+# ビルド成果物
+bin/
+garapon
+
+# テストカバレッジ
+coverage.out
+coverage.html
+*.out
+
+# Git
+.git/
+.gitignore
+
+# Docker 自身
+Dockerfile
+.dockerignore
+
+# ドキュメント
+*.md

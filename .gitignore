@@ -1,5 +1,6 @@
 # Compiled binaries
 garapon/garapon
+garapon/bin/
 otoshidama/otoshidama
 
 # Go build output
@@ -11,6 +12,10 @@ otoshidama/otoshidama
 
 # Go test output
 *.test
+
+# Coverage reports
+*.out
+coverage.html
 
 # Go workspace file
 go.work
